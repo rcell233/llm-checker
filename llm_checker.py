@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 BANK_URL = "https://raw.githubusercontent.com/rcell233/llm-checker/main/data/unified_bank.json"
@@ -213,30 +214,46 @@ def main(argv=None):
     parser.add_argument("-m", "--model", help="传给 codex exec 的模型名；省略时使用 Codex 默认模型")
     parser.add_argument("-r", "--reasoning", default="low", help="推理等级，默认 low")
     parser.add_argument("-n", "--number", type=int, default=3, help="探针数量，默认 3")
+    parser.add_argument("-j", "--max-concurrency", "--concurrency", type=int, default=3,
+                        help="最多同时运行的探针数，默认 3")
     parser.add_argument("--bank", help="自定义指纹库路径或 URL")
     parser.add_argument("--list-models", action="store_true", help="列出指纹库中的候选模型")
     parser.add_argument("--output", type=Path, help="保存回答、诊断和结果为 JSON")
     args = parser.parse_args(argv)
     if not 1 <= args.number <= 100:
         parser.error("-n 必须在 1 到 100 之间")
+    if args.max_concurrency < 1:
+        parser.error("-j 必须至少为 1")
     bank = load_bank(args.bank)
     if args.list_models:
         for model in bank["models"]:
             print(f'{model["id"]}\t{model.get("family") or "models"}')
         return 0
     executable = codex_executable()
-    responses = []
-    for index, challenge in enumerate(challenges(args.number), 1):
-        print(f"[{index}/{args.number}] 正在测试 {args.model or 'Codex 默认模型'}，目标 {challenge['expected_count']} 个数字…", flush=True)
-        try:
-            answer, usage = run_codex(executable, args.model, args.reasoning, challenge["prompt"])
-        except RuntimeError as error:
-            print(f"  失败：{error}", file=sys.stderr)
-            continue
-        response = {**challenge, "text": answer, "usage": usage}
-        responses.append(response)
-        count = len(numbers_from(answer))
-        print(f"  收到 {count} 个可解析数字；输出 tokens：{usage.get('output_tokens', '?')}", flush=True)
+    probes = list(challenges(args.number))
+    responses_by_index = [None] * len(probes)
+    workers = min(args.max_concurrency, len(probes))
+    print(f"开始测试 {args.model or 'Codex 默认模型'}：{len(probes)} 道探针，最多并发 {workers} 道…", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(run_codex, executable, args.model, args.reasoning, probe["prompt"]): index
+            for index, probe in enumerate(probes)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            probe = probes[index]
+            try:
+                answer, usage = future.result()
+            except (OSError, RuntimeError) as error:
+                print(f"[{index + 1}/{len(probes)}] 失败：{error}", file=sys.stderr, flush=True)
+                continue
+            responses_by_index[index] = {**probe, "text": answer, "usage": usage}
+            count = len(numbers_from(answer))
+            minimum = max(80, math.ceil(probe["expected_count"] * 0.55))
+            status = "有效" if count >= minimum else f"无效，少于 {minimum} 个，未计入结果"
+            print(f"[{index + 1}/{len(probes)}] 完成：目标 {probe['expected_count']}，收到 {count} 个可解析数字"
+                  f"（{status}）；输出 tokens：{usage.get('output_tokens', '?')}", flush=True)
+    responses = [response for response in responses_by_index if response is not None]
     result = analyze(responses, bank)
     print(f"\n归因结果：{result['prediction']} ({result['probability']:.1%})；有效回答 {result['used_outputs']}/{args.number}")
     print("模型家族：" + "，".join(f"{family} {probability:.1%}" for family, probability in

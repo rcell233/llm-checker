@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -66,6 +68,50 @@ class CheckerTests(unittest.TestCase):
         generate.assert_called_once_with(3)
         self.assertEqual(run.call_count, 3)
         self.assertTrue(all(call.args[2] == "low" for call in run.call_args_list))
+
+    def test_default_three_probes_start_concurrently(self):
+        bank = json.loads((ROOT / "data/unified_bank.json").read_text())
+        row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
+        probes = [{"id": str(index), "expected_count": 218, "prompt": str(index)} for index in range(3)]
+        barrier = threading.Barrier(3)
+
+        def run(*_):
+            barrier.wait(timeout=2)
+            return row["text"], {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.json"
+            with patch.object(llm_checker, "load_bank", return_value=bank), \
+                 patch.object(llm_checker, "codex_executable", return_value="codex"), \
+                 patch.object(llm_checker, "challenges", return_value=probes), \
+                 patch.object(llm_checker, "run_codex", side_effect=run):
+                self.assertEqual(llm_checker.main(["--output", str(output)]), 0)
+            saved = json.loads(output.read_text())
+            self.assertEqual([item["id"] for item in saved["responses"]], ["0", "1", "2"])
+
+    def test_one_worker_runs_probes_serially(self):
+        bank = json.loads((ROOT / "data/unified_bank.json").read_text())
+        row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
+        probes = [{"id": str(index), "expected_count": 218, "prompt": str(index)} for index in range(3)]
+        lock = threading.Lock()
+        active = peak = 0
+
+        def run(*_):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.01)
+            with lock:
+                active -= 1
+            return row["text"], {}
+
+        with patch.object(llm_checker, "load_bank", return_value=bank), \
+             patch.object(llm_checker, "codex_executable", return_value="codex"), \
+             patch.object(llm_checker, "challenges", return_value=probes), \
+             patch.object(llm_checker, "run_codex", side_effect=run):
+            self.assertEqual(llm_checker.main(["-j", "1"]), 0)
+        self.assertEqual(peak, 1)
 
 
 if __name__ == "__main__":
