@@ -16,7 +16,7 @@ wget -qO- "https://raw.githubusercontent.com/rcell233/llm-checker/main/llm_check
 python3 llm_checker.py -m gpt-6-astra
 ```
 
-`-n` 是一次归因所用的独立探针数量，默认 3；三份回答合起来出一次结果。`-j`（`--max-concurrency`）控制同时运行的探针上限，默认 3，所以默认三道题一起发送；`-j 1` 可顺序运行，`-n 5 -j 5` 可五道并发。每道探针都调用一次 `codex exec`，消耗对应模型额度。`-r` 默认 `low`，可显式指定 `high` 等等级。`-m` 省略时使用 Codex 的默认模型。`--list-models` 查看库内候选；`--output results/run.json` 保存提示词、原始回答和评分结果；`--bank /path/to/unified_bank.json` 可使用自定义指纹库。脚本中的 `codex exec` 采用只读沙盒、临时会话并关闭跨会话记忆。
+`-n` 是一次归因所用的独立探针数量，默认 3；三份回答合起来出一次结果。`-j`（`--max-concurrency`）控制同时运行的探针上限，默认 1，所以默认顺序执行；`-j 3` 可让默认三道题并发，`-n 5 -j 5` 可五道并发。每道探针都调用一次 `codex exec`，消耗对应模型额度。`-r` 默认 `low`，可显式指定 `high` 等等级。`-m` 省略时使用 Codex 的默认模型。`--list-models` 查看库内候选；`--output results/run.json` 保存提示词、原始回答和评分结果；`--bank /path/to/unified_bank.json` 可使用自定义指纹库。脚本中的 `codex exec` 采用只读沙盒、临时会话并关闭跨会话记忆。
 
 结果是**当前候选模型集合内**的相对概率，不能证明实际模型身份。库外模型也会被归到最相近的库内模型。环境中的系统提示、模型版本、推理设置和提供商实现都可能改变数字偏好；GPT 参考数据来自官方 Codex，Claude 参考数据来自 OAIPro，跨环境解读尤其需要谨慎。原始 ModelTrace 的 [说明](https://github.com/xqy2006/ModelTrace#%E5%A3%B0%E6%98%8E) 也指出这些限制。
 

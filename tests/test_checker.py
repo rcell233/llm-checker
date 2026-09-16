@@ -69,7 +69,7 @@ class CheckerTests(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
         self.assertTrue(all(call.args[2] == "low" for call in run.call_args_list))
 
-    def test_default_three_probes_start_concurrently(self):
+    def test_three_probes_start_concurrently_when_requested(self):
         bank = json.loads((ROOT / "data/unified_bank.json").read_text())
         row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
         probes = [{"id": str(index), "expected_count": 218, "prompt": str(index)} for index in range(3)]
@@ -85,11 +85,11 @@ class CheckerTests(unittest.TestCase):
                  patch.object(llm_checker, "codex_executable", return_value="codex"), \
                  patch.object(llm_checker, "challenges", return_value=probes), \
                  patch.object(llm_checker, "run_codex", side_effect=run):
-                self.assertEqual(llm_checker.main(["--output", str(output)]), 0)
+                self.assertEqual(llm_checker.main(["-j", "3", "--output", str(output)]), 0)
             saved = json.loads(output.read_text())
             self.assertEqual([item["id"] for item in saved["responses"]], ["0", "1", "2"])
 
-    def test_one_worker_runs_probes_serially(self):
+    def test_default_one_worker_runs_probes_serially(self):
         bank = json.loads((ROOT / "data/unified_bank.json").read_text())
         row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
         probes = [{"id": str(index), "expected_count": 218, "prompt": str(index)} for index in range(3)]
@@ -110,7 +110,7 @@ class CheckerTests(unittest.TestCase):
              patch.object(llm_checker, "codex_executable", return_value="codex"), \
              patch.object(llm_checker, "challenges", return_value=probes), \
              patch.object(llm_checker, "run_codex", side_effect=run):
-            self.assertEqual(llm_checker.main(["-j", "1"]), 0)
+            self.assertEqual(llm_checker.main([]), 0)
         self.assertEqual(peak, 1)
 
 
