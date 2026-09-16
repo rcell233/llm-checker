@@ -211,7 +211,7 @@ def load_bank(source):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="用本机 Codex CLI 运行 ModelTrace 模型指纹测试")
     parser.add_argument("-m", "--model", help="传给 codex exec 的模型名；省略时使用 Codex 默认模型")
-    parser.add_argument("-r", "--reasoning", default="high", help="推理等级，默认 high")
+    parser.add_argument("-r", "--reasoning", default="low", help="推理等级，默认 low")
     parser.add_argument("-n", "--number", type=int, default=3, help="探针数量，默认 3")
     parser.add_argument("--bank", help="自定义指纹库路径或 URL")
     parser.add_argument("--list-models", action="store_true", help="列出指纹库中的候选模型")

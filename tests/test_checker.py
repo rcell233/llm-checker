@@ -32,8 +32,9 @@ class CheckerTests(unittest.TestCase):
         row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
         with patch.object(llm_checker, "load_bank", return_value=bank), \
              patch.object(llm_checker, "codex_executable", return_value="codex"), \
-             patch.object(llm_checker, "run_codex", return_value=(row["text"], {"output_tokens": 10})):
+             patch.object(llm_checker, "run_codex", return_value=(row["text"], {"output_tokens": 10})) as run:
             self.assertEqual(llm_checker.main(["-m", "gpt-5.5", "-n", "1"]), 0)
+            self.assertEqual(run.call_args.args[2], "low")
 
     def test_model_collection_resumes_without_duplicate_rows(self):
         from challenge_suite import fingerprint_suite
@@ -52,6 +53,19 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(len(rows), 3)
             self.assertEqual(request.call_count, 3)
             self.assertTrue(all(json.loads(line)["strict_valid"] for line in rows))
+
+    def test_defaults_use_three_probes_and_low_reasoning(self):
+        bank = json.loads((ROOT / "data/unified_bank.json").read_text())
+        row = json.loads((ROOT / "data/gpt_reference.jsonl").read_text().splitlines()[0])
+        probes = [{"id": str(index), "expected_count": 218, "prompt": "test"} for index in range(3)]
+        with patch.object(llm_checker, "load_bank", return_value=bank), \
+             patch.object(llm_checker, "codex_executable", return_value="codex"), \
+             patch.object(llm_checker, "challenges", return_value=probes) as generate, \
+             patch.object(llm_checker, "run_codex", return_value=(row["text"], {})) as run:
+            self.assertEqual(llm_checker.main(["-m", "gpt-6-astra"]), 0)
+        generate.assert_called_once_with(3)
+        self.assertEqual(run.call_count, 3)
+        self.assertTrue(all(call.args[2] == "low" for call in run.call_args_list))
 
 
 if __name__ == "__main__":

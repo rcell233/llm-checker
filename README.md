@@ -4,19 +4,19 @@
 
 ## 一键测试
 
-前提：已安装并登录 `codex` CLI，且可用 `python3`。例如测试 Codex 中的 `gpt-5.5`，运行 5 次探针：
+前提：已安装并登录 `codex` CLI，且可用 `python3`。例如测试 Codex 中的 `gpt-6-astra`，运行默认的 3 道探针：
 
 ```sh
-wget -qO- "https://raw.githubusercontent.com/rcell233/llm-checker/main/llm_checker.py" | python3 - -m gpt-5.5 -r high -n 5
+wget -qO- "https://raw.githubusercontent.com/rcell233/llm-checker/main/llm_checker.py" | python3 - -m gpt-6-astra
 ```
 
 或在本地仓库运行：
 
 ```sh
-python3 llm_checker.py -m gpt-5.5 -r high -n 5
+python3 llm_checker.py -m gpt-6-astra
 ```
 
-`-n` 是独立探针数量，默认 3；每次探针都调用一次 `codex exec`，消耗对应模型额度。`-m` 省略时使用 Codex 的默认模型。`--list-models` 查看库内候选；`--output results/run.json` 保存提示词、原始回答和评分结果；`--bank /path/to/unified_bank.json` 可使用自定义指纹库。脚本中的 `codex exec` 采用只读沙盒、临时会话并关闭跨会话记忆。
+`-n` 是一次归因所用的独立探针数量，默认 3；三份回答合起来出一次结果。每道探针都调用一次 `codex exec`，消耗对应模型额度。`-r` 默认 `low`，可显式指定 `high` 等等级。`-m` 省略时使用 Codex 的默认模型。`--list-models` 查看库内候选；`--output results/run.json` 保存提示词、原始回答和评分结果；`--bank /path/to/unified_bank.json` 可使用自定义指纹库。脚本中的 `codex exec` 采用只读沙盒、临时会话并关闭跨会话记忆。
 
 结果是**当前候选模型集合内**的相对概率，不能证明实际模型身份。库外模型也会被归到最相近的库内模型。环境中的系统提示、模型版本、推理设置和提供商实现都可能改变数字偏好；GPT 参考数据来自官方 Codex，Claude 参考数据来自 OAIPro，跨环境解读尤其需要谨慎。原始 ModelTrace 的 [说明](https://github.com/xqy2006/ModelTrace#%E5%A3%B0%E6%98%8E) 也指出这些限制。
 
