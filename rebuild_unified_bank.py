@@ -13,7 +13,13 @@ DATA = PROJECT / "data"
 
 def main() -> None:
     rows = []
-    sources = sorted(DATA.glob("*_reference.jsonl"))
+    sources = sorted(
+        DATA.glob("*_reference.jsonl"),
+        key=lambda path: (
+            {"gpt": 0, "claude": 1}.get(path.name.removesuffix("_reference.jsonl"), 2),
+            path.name,
+        ),
+    )
     if not sources:
         raise ValueError("data/ 中没有 *_reference.jsonl 参考数据")
     for path in sources:
