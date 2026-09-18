@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -12,11 +13,16 @@ import secrets
 import shutil
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 BANK_URL = "https://raw.githubusercontent.com/rcell233/llm-checker/main/data/unified_bank.json"
+CODEX_TIMEOUT_SECONDS = 120
+MAX_ANSWER_CHARS = 8192
+OFFICIAL_PROVIDER_IDS = {"openai", "ollama", "lmstudio", "amazon-bedrock"}
+AUTH_HEADER_NAMES = {"authorization", "x-api-key", "api-key"}
 
 
 def numbers_from(text):
@@ -167,64 +173,365 @@ def codex_executable():
     raise RuntimeError("找不到 codex 命令；请先安装并登录 Codex CLI")
 
 
-def get_codex_account_info():
-    """获取 Codex 账号信息用于显示"""
-    import base64
+def _codex_home():
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured) if configured else Path.home() / ".codex"
 
-    # 获取 CODEX_HOME，默认为 ~/.codex
-    codex_home_str = os.environ.get("CODEX_HOME")
-    if codex_home_str:
-        codex_home = Path(codex_home_str)
-    else:
-        codex_home = Path.home() / ".codex"
 
-    auth_file = codex_home / "auth.json"
+def _strip_toml_comment(line):
+    in_quote = False
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if in_quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                in_quote = False
+            continue
+        if char in "\"'":
+            in_quote = True
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
 
-    # 检查官方登录
-    if auth_file.exists():
+
+def _unquote_toml(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _split_toml_items(text, delimiter):
+    items, current, in_quote, quote, escaped, depth = [], [], False, "", False, 0
+    for char in text:
+        if in_quote:
+            current.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                in_quote = False
+            continue
+        if char in "\"'":
+            in_quote = True
+            quote = char
+            current.append(char)
+        elif char in "{[":
+            depth += 1
+            current.append(char)
+        elif char in "}]":
+            depth = max(0, depth - 1)
+            current.append(char)
+        elif char == delimiter and depth == 0:
+            item = "".join(current).strip()
+            if item:
+                items.append(item)
+            current = []
+        else:
+            current.append(char)
+    item = "".join(current).strip()
+    if item:
+        items.append(item)
+    return items
+
+
+def _parse_toml_value(raw):
+    value = raw.strip()
+    if value.startswith("{") and value.endswith("}"):
+        table = {}
+        for item in _split_toml_items(value[1:-1], ","):
+            if "=" not in item:
+                continue
+            key, nested = item.split("=", 1)
+            table[_unquote_toml(key)] = _parse_toml_value(nested)
+        return table
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    return _unquote_toml(value)
+
+
+def _set_toml_path(root, parts):
+    cursor = root
+    for part in parts:
+        next_value = cursor.get(part)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cursor[part] = next_value
+        cursor = next_value
+    return cursor
+
+
+def parse_simple_toml(text):
+    """Parse the small TOML subset used in Codex config files."""
+    data = {}
+    section = []
+    for raw in text.splitlines():
+        line = _strip_toml_comment(raw).strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            header = line[1:-1].strip()
+            if header.startswith("[") and header.endswith("]"):
+                continue
+            section = [_unquote_toml(part) for part in _split_toml_items(header, ".") if part.strip()]
+            _set_toml_path(data, section)
+            continue
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        _set_toml_path(data, section)[_unquote_toml(key)] = _parse_toml_value(raw_value)
+    return data
+
+
+def _host_from_url(url):
+    parsed = urllib.parse.urlparse(url if "://" in url else f"https://{url}")
+    return parsed.netloc or url
+
+
+def _is_official_openai_url(url):
+    host = _host_from_url(url).lower()
+    return host == "openai.com" or host.endswith(".openai.com") or host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+def _mask_secret(secret):
+    token = (secret or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if len(token) <= 8:
+        return ""
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def _secret_from_headers(headers):
+    if not isinstance(headers, dict):
+        return ""
+    for key, value in headers.items():
+        if str(key).lower() in AUTH_HEADER_NAMES and isinstance(value, str):
+            masked = _mask_secret(value)
+            if masked:
+                return masked
+    return ""
+
+
+def _secret_from_env_headers(headers):
+    if not isinstance(headers, dict):
+        return ""
+    for key, env_name in headers.items():
+        if str(key).lower() not in AUTH_HEADER_NAMES or not isinstance(env_name, str) or not env_name.strip():
+            continue
+        masked = _mask_secret(os.environ.get(env_name, ""))
+        if masked:
+            return masked
+        return env_name.strip()
+    return ""
+
+
+def _load_auth_data(auth_file):
+    if not auth_file.exists():
+        return {}
+    try:
+        data = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _auth_file_key(auth_data):
+    for key in ("OPENAI_API_KEY", "openai_api_key", "api_key"):
+        masked = _mask_secret(auth_data.get(key) or "")
+        if masked:
+            return masked
+    return ""
+
+
+def _openai_env_key():
+    for env_name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        masked = _mask_secret(os.environ.get(env_name, ""))
+        if masked:
+            return masked
+    return ""
+
+
+def _provider_secret(provider, auth_data=None):
+    if not isinstance(provider, dict):
+        return ""
+    headers_secret = _secret_from_headers(provider.get("http_headers"))
+    if headers_secret:
+        return headers_secret
+    env_headers = _secret_from_env_headers(provider.get("env_http_headers"))
+    if env_headers:
+        return env_headers
+    token = provider.get("experimental_bearer_token")
+    if isinstance(token, str):
+        masked = _mask_secret(token)
+        if masked:
+            return masked
+    env_key = provider.get("env_key")
+    if isinstance(env_key, str) and env_key.strip():
+        masked = _mask_secret(os.environ.get(env_key, ""))
+        if masked:
+            return masked
+        if env_key.strip() in {"OPENAI_API_KEY", "CODEX_API_KEY"}:
+            fallback = _auth_file_key(auth_data or {})
+            if fallback:
+                return fallback
+        return env_key.strip()
+    auth = provider.get("auth")
+    if isinstance(auth, dict):
+        command = auth.get("command")
+        if isinstance(command, str) and command.strip():
+            return f"凭证命令 {Path(command).name}"
+    return ""
+
+
+def _format_provider_account(provider_id, provider, base_url="", extra=""):
+    name = provider.get("name") if isinstance(provider.get("name"), str) and provider.get("name").strip() else provider_id
+    url = provider.get("base_url") if isinstance(provider.get("base_url"), str) else base_url
+    host = _host_from_url(url) if url else ""
+    details = [item for item in (host, extra) if item]
+    if details:
+        return f"API: {name} ({', '.join(details)})"
+    return f"API: {name}"
+
+
+def _custom_providers(config):
+    providers = config.get("model_providers")
+    if not isinstance(providers, dict):
+        return {}
+    return {key: value for key, value in providers.items()
+            if key not in OFFICIAL_PROVIDER_IDS and isinstance(value, dict)}
+
+
+def _chatgpt_account(auth_data):
+    if auth_data.get("auth_mode") != "chatgpt":
+        return ""
+    tokens = auth_data.get("tokens", {})
+    id_token = tokens.get("id_token", "") if isinstance(tokens, dict) else ""
+    if isinstance(id_token, str) and "." in id_token:
         try:
-            auth_data = json.loads(auth_file.read_text(encoding="utf-8"))
-            auth_mode = auth_data.get("auth_mode", "")
-
-            if auth_mode == "chatgpt":
-                # 从 id_token 中解析邮箱
-                tokens = auth_data.get("tokens", {})
-                id_token = tokens.get("id_token", "")
-                if id_token and "." in id_token:
-                    try:
-                        # JWT token 格式：header.payload.signature
-                        parts = id_token.split(".")
-                        if len(parts) >= 2:
-                            payload = parts[1]
-                            # 添加必要的 padding
-                            padding = len(payload) % 4
-                            if padding:
-                                payload += "=" * (4 - padding)
-                            decoded = base64.urlsafe_b64decode(payload)
-                            token_data = json.loads(decoded)
-                            email = token_data.get("email", "")
-                            if email:
-                                return f"ChatGPT 账号: {email}"
-                    except Exception:
-                        pass
-                return "ChatGPT 官方登录"
-            elif auth_mode == "api":
-                api_key = auth_data.get("OPENAI_API_KEY", "")
-                if api_key and len(api_key) > 8:
-                    masked_key = f"{api_key[:4]}...{api_key[-4:]}"
-                    return f"API Key: {masked_key}"
+            parts = id_token.split(".")
+            if len(parts) >= 2:
+                payload = parts[1]
+                padding = len(payload) % 4
+                if padding:
+                    payload += "=" * (4 - padding)
+                token_data = json.loads(base64.urlsafe_b64decode(payload))
+                email = token_data.get("email", "")
+                if email:
+                    return f"ChatGPT 账号: {email}"
         except Exception:
             pass
+    return "ChatGPT 官方登录"
 
+
+def _auth_file_account(auth_data):
+    chatgpt = _chatgpt_account(auth_data)
+    if chatgpt:
+        return chatgpt
+    masked = _auth_file_key(auth_data)
+    if masked:
+        return f"API Key: {masked}"
+    if auth_data.get("auth_mode") == "api":
+        return "API Key 登录"
+    return ""
+
+
+def _format_bedrock_account(providers):
+    table = providers.get("amazon-bedrock") if isinstance(providers.get("amazon-bedrock"), dict) else {}
+    aws = table.get("aws") if isinstance(table.get("aws"), dict) else {}
+    profile = aws.get("profile") if isinstance(aws.get("profile"), str) and aws.get("profile").strip() else "default"
+    region = aws.get("region") if isinstance(aws.get("region"), str) else ""
+    details = [f"profile={profile}"]
+    if region:
+        details.append(region)
+    return f"API: Amazon Bedrock ({', '.join(details)})"
+
+
+def _active_api_account(config, auth_data):
+    if not config:
+        return ""
+    provider_id = config.get("model_provider")
+    provider_id = provider_id.strip() if isinstance(provider_id, str) else ""
+    providers = config.get("model_providers") if isinstance(config.get("model_providers"), dict) else {}
+    if provider_id == "amazon-bedrock":
+        return _format_bedrock_account(providers)
+    if provider_id in {"ollama", "lmstudio"}:
+        return f"本地 {provider_id}"
+    if provider_id and provider_id != "openai":
+        provider = providers.get(provider_id) if isinstance(providers.get(provider_id), dict) else {}
+        extra = _provider_secret(provider, auth_data)
+        if provider.get("requires_openai_auth"):
+            extra = extra or _chatgpt_account(auth_data) or _auth_file_key(auth_data) or _openai_env_key()
+        return _format_provider_account(provider_id, provider, extra=extra)
+    openai_base_url = config.get("openai_base_url")
+    if isinstance(openai_base_url, str) and openai_base_url.strip() and not _is_official_openai_url(openai_base_url):
+        openai = providers.get("openai") if isinstance(providers.get("openai"), dict) else {}
+        extra = _provider_secret(openai, auth_data) or _openai_env_key() or _auth_file_key(auth_data)
+        return _format_provider_account("OpenAI 兼容接口", openai, openai_base_url.strip(), extra)
+    return ""
+
+
+def load_codex_config(home=None):
+    home = Path(home) if home else _codex_home()
+    config_file = home / "config.toml"
+    if not config_file.exists():
+        return {}
+    try:
+        return parse_simple_toml(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def get_codex_account_info(home=None):
+    """获取 Codex 账号信息用于显示。"""
+    home = Path(home) if home else _codex_home()
+    config = load_codex_config(home)
+    auth_data = _load_auth_data(home / "auth.json")
+    active = _active_api_account(config, auth_data)
+    if active:
+        return active
+    auth = _auth_file_account(auth_data)
+    if auth:
+        return auth
+    env_key = _openai_env_key()
+    if env_key:
+        return f"API Key: {env_key}（环境变量）"
+    custom = _custom_providers(config)
+    if custom:
+        provider_id, provider = next(iter(custom.items()))
+        return _format_provider_account(provider_id, provider, extra=_provider_secret(provider, auth_data))
     return "本地 Codex"
 
 
-def run_codex(executable, model, effort, prompt):
+def format_codex_home(home=None):
+    home = Path(home) if home else _codex_home()
+    label = str(home.expanduser())
+    if os.environ.get("CODEX_HOME"):
+        return f"{label}（环境变量）"
+    return label
+
+
+def run_codex(executable, model, effort, prompt, timeout=CODEX_TIMEOUT_SECONDS):
     command = [executable, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
                "--disable", "memories", "-c", f"model_reasoning_effort={effort}"]
     if model:
         command.extend(["-m", model])
-    process = subprocess.run(command, input=prompt, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    run_kwargs = {}
+    if os.name != "nt":
+        run_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.run(
+            command, input=prompt, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, timeout=timeout, **run_kwargs)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Codex 超过 {timeout} 秒未返回，已中止（可能陷入重复输出）") from error
     if process.returncode:
         raise RuntimeError(process.stderr.strip() or process.stdout.strip() or "codex exec 失败")
     answer, usage = "", {}
@@ -239,6 +546,8 @@ def run_codex(executable, model, effort, prompt):
             usage = event.get("usage") or {}
     if not answer:
         raise RuntimeError("Codex 未返回最终文本")
+    if len(answer) > MAX_ANSWER_CHARS:
+        raise RuntimeError(f"回答过长（{len(answer)} 字符），可能陷入重复输出，本次不计入")
     return answer, usage
 
 
@@ -268,6 +577,8 @@ def main(argv=None):
     parser.add_argument("-n", "--number", type=int, default=3, help="探针数量，默认 3")
     parser.add_argument("-j", "--max-concurrency", "--concurrency", type=int, default=3,
                         help="最多同时运行的探针数，默认 3")
+    parser.add_argument("--timeout", type=int, default=CODEX_TIMEOUT_SECONDS,
+                        help=f"单次探针超时秒数，默认 {CODEX_TIMEOUT_SECONDS}")
     parser.add_argument("--bank", help="自定义指纹库路径或 URL")
     parser.add_argument("--list-models", action="store_true", help="列出指纹库中的候选模型")
     parser.add_argument("--output", type=Path, help="保存回答、诊断和结果为 JSON")
@@ -276,21 +587,23 @@ def main(argv=None):
         parser.error("-n 必须在 1 到 100 之间")
     if args.max_concurrency < 1:
         parser.error("-j 必须至少为 1")
+    if args.timeout < 1:
+        parser.error("--timeout 必须至少为 1")
     bank = load_bank(args.bank)
     if args.list_models:
         for model in bank["models"]:
             print(f'{model["id"]}\t{model.get("family") or "models"}')
         return 0
     executable = codex_executable()
-    account_info = get_codex_account_info()
-    print(f"Codex 账号：{account_info}", flush=True)
+    print(f"CODEX_HOME：{format_codex_home()}", flush=True)
+    print(f"Codex 账号：{get_codex_account_info()}", flush=True)
     probes = list(challenges(args.number))
     responses_by_index = [None] * len(probes)
     workers = min(args.max_concurrency, len(probes))
-    print(f"开始测试 {args.model or 'Codex 默认模型'}：{len(probes)} 道探针，最多并发 {workers} 道…", flush=True)
+    print(f"开始测试 {args.model or 'Codex 默认模型'}：{len(probes)} 道探针，最多并发 {workers} 道，超时 {args.timeout}s…", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(run_codex, executable, args.model, args.reasoning, probe["prompt"]): index
+            pool.submit(run_codex, executable, args.model, args.reasoning, probe["prompt"], args.timeout): index
             for index, probe in enumerate(probes)
         }
         for future in as_completed(futures):
