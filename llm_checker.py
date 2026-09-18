@@ -271,8 +271,8 @@ def main(argv=None):
     parser.add_argument("-m", "--model", help="传给 codex exec 的模型名；省略时使用 Codex 默认模型")
     parser.add_argument("-r", "--reasoning", default="low", help="推理等级，默认 low")
     parser.add_argument("-n", "--number", type=int, default=3, help="探针数量，默认 3")
-    parser.add_argument("-j", "--max-concurrency", "--concurrency", type=int, default=1,
-                        help="最多同时运行的探针数，默认 1")
+    parser.add_argument("-j", "--max-concurrency", "--concurrency", type=int, default=3,
+                        help="最多同时运行的探针数，默认 3")
     parser.add_argument("--bank", help="自定义指纹库路径或 URL")
     parser.add_argument("--list-models", action="store_true", help="列出指纹库中的候选模型")
     parser.add_argument("--output", type=Path, help="保存回答、诊断和结果为 JSON")
