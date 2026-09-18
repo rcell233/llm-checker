@@ -167,6 +167,63 @@ def codex_executable():
     raise RuntimeError("找不到 codex 命令；请先安装并登录 Codex CLI")
 
 
+def get_codex_account_info():
+    """获取 Codex 账号信息用于显示"""
+    codex_home = Path.home() / ".codex"
+    auth_file = codex_home / "auth.json"
+    config_file = codex_home / "config.toml"
+
+    # 检查是否使用 API
+    if config_file.exists():
+        try:
+            config_content = config_file.read_text(encoding="utf-8")
+            # 简单检查是否有 API key 配置
+            if "OPENAI_API_KEY" in config_content or "api_key" in config_content.lower():
+                # 尝试从环境变量或配置中提取
+                api_key = os.environ.get("OPENAI_API_KEY", "")
+                if api_key and len(api_key) > 8:
+                    masked_key = f"{api_key[:4]}...{api_key[-4:]}"
+                    return f"API Key: {masked_key}"
+        except Exception:
+            pass
+
+    # 检查官方登录
+    if auth_file.exists():
+        try:
+            auth_data = json.loads(auth_file.read_text(encoding="utf-8"))
+            auth_mode = auth_data.get("auth_mode", "")
+
+            if auth_mode == "chatgpt":
+                # 从 id_token 中解析邮箱
+                id_token = auth_data.get("tokens", {}).get("id_token", "")
+                if id_token:
+                    try:
+                        # JWT token 格式：header.payload.signature
+                        import base64
+                        payload = id_token.split(".")[1]
+                        # 添加必要的 padding
+                        padding = len(payload) % 4
+                        if padding:
+                            payload += "=" * (4 - padding)
+                        decoded = base64.urlsafe_b64decode(payload)
+                        token_data = json.loads(decoded)
+                        email = token_data.get("email", "")
+                        if email:
+                            return f"ChatGPT 账号: {email}"
+                    except Exception:
+                        pass
+                return "ChatGPT 官方登录"
+            elif auth_mode == "api":
+                api_key = auth_data.get("OPENAI_API_KEY", "")
+                if api_key and len(api_key) > 8:
+                    masked_key = f"{api_key[:4]}...{api_key[-4:]}"
+                    return f"API Key: {masked_key}"
+        except Exception:
+            pass
+
+    return "本地 Codex"
+
+
 def run_codex(executable, model, effort, prompt):
     command = [executable, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
                "--disable", "memories", "-c", f"model_reasoning_effort={effort}"]
@@ -230,6 +287,8 @@ def main(argv=None):
             print(f'{model["id"]}\t{model.get("family") or "models"}')
         return 0
     executable = codex_executable()
+    account_info = get_codex_account_info()
+    print(f"Codex 账号：{account_info}", flush=True)
     probes = list(challenges(args.number))
     responses_by_index = [None] * len(probes)
     workers = min(args.max_concurrency, len(probes))
