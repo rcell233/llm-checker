@@ -171,7 +171,13 @@ def get_codex_account_info():
     """获取 Codex 账号信息用于显示"""
     import base64
 
-    codex_home = Path.home() / ".codex"
+    # 获取 CODEX_HOME，默认为 ~/.codex
+    codex_home_str = os.environ.get("CODEX_HOME")
+    if codex_home_str:
+        codex_home = Path(codex_home_str)
+    else:
+        codex_home = Path.home() / ".codex"
+
     auth_file = codex_home / "auth.json"
 
     # 检查官方登录
