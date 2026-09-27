@@ -28,7 +28,9 @@ python3 llm_checker.py -m gpt-6-astra
 - `--output <file>`：保存提示词、原始回答和评分结果为 JSON
 - `--bank <path>`：使用自定义指纹库
 
-运行脚本只使用 Python 标准库；首次会从本仓库下载约 670 KB 的统一指纹库。如果在本仓库目录运行，会直接读取本地 `data/unified_bank.json`。
+运行脚本只使用 Python 标准库；首次会从本仓库下载约 834 KB 的统一指纹库。如果在本仓库目录运行，会直接读取本地 `data/unified_bank.json`。
+
+当前指纹库同步自 [ModelTrace `55a2e4a`](https://github.com/xqy2006/ModelTrace/commit/55a2e4a55170423b484d701e9a82ab62b268c811)，共 16 个候选模型，包含 `gpt-6-sol`、`gpt-6-luna` 和 `claude-opus-5-5`。原始参考数据与统一指纹库均直接采用该上游版本。
 
 ### 结果说明
 
