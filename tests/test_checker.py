@@ -289,5 +289,240 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[4], 15)
 
 
+
+class ClaudeConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.home = root / "home"
+        self.project = root / "project"
+        self.managed = root / "managed"
+        for path in (self.home / ".claude", self.project / ".claude", self.managed):
+            path.mkdir(parents=True)
+        self.env = patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", "")}, clear=True)
+        self.env.start()
+        self.managed_patch = patch.object(llm_checker, "_managed_settings_dir", return_value=self.managed)
+        self.managed_patch.start()
+
+    def tearDown(self):
+        self.managed_patch.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def write(self, path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def resolve(self, tier="opus"):
+        return llm_checker.resolve_claude_config(tier, self.project)
+
+    def test_tier_detection(self):
+        self.assertEqual(llm_checker.claude_tier(" Opus "), "opus")
+        self.assertEqual(llm_checker.claude_tier("fable"), "fable")
+        self.assertEqual(llm_checker.claude_tier("gpt-5.5"), "")
+        self.assertEqual(llm_checker.claude_tier(None), "")
+
+    def test_settings_layers_follow_claude_code_precedence(self):
+        os.environ["ANTHROPIC_BASE_URL"] = "https://shell.invalid"
+        self.write(self.home / ".claude/settings.json", {"env": {
+            "ANTHROPIC_BASE_URL": "https://user.invalid/",
+            "ANTHROPIC_AUTH_TOKEN": "sk-USERTOKEN12345678",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-user",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-user",
+        }})
+        self.write(self.project / ".claude/settings.json", {"env": {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-project",
+            "ANTHROPIC_BASE_URL": "https://project.invalid",
+        }})
+        self.write(self.project / ".claude/settings.local.json", {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-local"}})
+        config = self.resolve()
+        self.assertEqual(config["model"], "claude-opus-local")
+        self.assertEqual(config["model_var"], "ANTHROPIC_DEFAULT_OPUS_MODEL")
+        self.assertTrue(config["model_source"].endswith(".claude/settings.local.json"))
+        self.assertEqual(config["url"], "https://project.invalid/v1/messages")
+        self.assertEqual(config["headers"]["authorization"], "Bearer sk-USERTOKEN12345678")
+        self.assertNotIn("x-api-key", config["headers"])
+        self.assertEqual(config["credential_source"], "~/.claude/settings.json")
+        self.assertEqual(self.resolve("sonnet")["model"], "claude-sonnet-user")
+        self.assertEqual(len(config["files"]), 3)
+
+    def test_managed_settings_and_drop_ins_override_everything(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-SHELLKEY12345678"
+        self.write(self.project / ".claude/settings.local.json", {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "local"}})
+        self.write(self.managed / "managed-settings.json", {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "managed"}})
+        self.write(self.managed / "managed-settings.d/10-a.json", {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "drop-in-a"}})
+        self.write(self.managed / "managed-settings.d/20-b.json", {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "drop-in-b"}})
+        config = self.resolve()
+        self.assertEqual(config["model"], "drop-in-b")
+        self.assertEqual(config["headers"]["x-api-key"], "sk-SHELLKEY12345678")
+        self.assertEqual(config["credential_source"], "环境变量")
+        self.assertEqual(config["url"], "https://api.anthropic.com/v1/messages")
+
+    def test_claude_config_dir_relocates_user_settings(self):
+        custom = Path(self.temp.name) / "custom-claude"
+        self.write(custom / "settings.json", {"env": {"ANTHROPIC_API_KEY": "sk-CUSTOMDIR1234567"}})
+        self.write(self.home / ".claude/settings.json", {"env": {"ANTHROPIC_API_KEY": "sk-IGNORED123456789"}})
+        os.environ["CLAUDE_CONFIG_DIR"] = str(custom)
+        config = self.resolve()
+        self.assertEqual(config["secret"], "sk-CUSTOMDIR1234567")
+        self.assertEqual(config["config_dir"], custom)
+
+    def test_model_name_fallback_and_context_suffix(self):
+        self.write(self.home / ".claude/settings.json", {"env": {
+            "ANTHROPIC_API_KEY": "sk-TESTKEY123456789",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "claude-opus-5-5",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1[1m]",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "Haiku (fast)",
+        }})
+        opus = self.resolve("opus")
+        self.assertEqual(opus["model"], "claude-opus-5-5")
+        self.assertEqual(opus["model_var"], "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
+        self.assertEqual(self.resolve("fable")["model"], "claude-fable-5-1")
+        haiku = self.resolve("haiku")
+        self.assertEqual(haiku["model"], llm_checker.CLAUDE_DEFAULT_MODELS["haiku"])
+        self.assertEqual(haiku["model_var"], "")
+
+    def test_empty_settings_value_unsets_shell_token(self):
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = "sk-SHELLTOKEN123456"
+        self.write(self.home / ".claude/settings.json", {"env": {
+            "ANTHROPIC_AUTH_TOKEN": "", "ANTHROPIC_API_KEY": "sk-SETTINGSKEY12345"}})
+        config = self.resolve()
+        self.assertEqual(config["credential"], "ANTHROPIC_API_KEY")
+        self.assertEqual(config["headers"]["x-api-key"], "sk-SETTINGSKEY12345")
+        self.assertNotIn("authorization", config["headers"])
+
+    def test_api_key_helper_output_is_used(self):
+        self.write(self.project / ".claude/settings.json", {"apiKeyHelper": "echo sk-HELPERKEY1234567"})
+        config = self.resolve()
+        self.assertEqual(config["credential"], "apiKeyHelper")
+        self.assertEqual(config["headers"]["x-api-key"], "sk-HELPERKEY1234567")
+        self.assertEqual(config["headers"]["authorization"], "Bearer sk-HELPERKEY1234567")
+
+    def test_custom_headers_betas_and_proxy_from_settings(self):
+        self.write(self.home / ".claude/settings.json", {"env": {
+            "ANTHROPIC_AUTH_TOKEN": "sk-TESTTOKEN1234567",
+            "ANTHROPIC_BASE_URL": "https://relay.invalid/api",
+            "ANTHROPIC_CUSTOM_HEADERS": "X-Relay-Group: team-a\nX-Trace:  on ",
+            "ANTHROPIC_BETAS": "beta-a, beta-b",
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+        }})
+        config = self.resolve()
+        self.assertEqual(config["url"], "https://relay.invalid/api/v1/messages")
+        self.assertEqual(config["headers"]["x-relay-group"], "team-a")
+        self.assertEqual(config["headers"]["x-trace"], "on")
+        self.assertEqual(config["headers"]["anthropic-beta"], "beta-a,beta-b")
+        self.assertEqual(config["proxies"], {"https": "http://127.0.0.1:7890"})
+        os.environ["NO_PROXY"] = "relay.invalid"
+        self.assertEqual(self.resolve()["proxies"], {})
+
+    def test_official_login_is_rejected(self):
+        (self.home / ".claude/.credentials.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "官方账号"):
+            self.resolve()
+
+    def test_missing_credentials_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "未找到 Claude Code 的 API 凭证"):
+            self.resolve()
+
+    def test_cloud_provider_is_rejected(self):
+        self.write(self.home / ".claude/settings.json", {"env": {
+            "CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_API_KEY": "sk-TESTKEY123456789"}})
+        with self.assertRaisesRegex(RuntimeError, "Amazon Bedrock"):
+            self.resolve()
+
+    def test_invalid_settings_json_is_reported(self):
+        (self.project / ".claude/settings.json").write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "不是合法 JSON"):
+            self.resolve()
+
+    def test_cli_uses_claude_api_for_tier(self):
+        bank = json.loads((ROOT / "data/unified_bank.json").read_text())
+        row = json.loads((ROOT / "data/claude_reference.jsonl").read_text().splitlines()[0])
+        self.write(self.project / ".claude/settings.json", {"env": {
+            "ANTHROPIC_AUTH_TOKEN": "sk-TESTTOKEN1234567",
+            "ANTHROPIC_BASE_URL": "https://relay.invalid",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
+        }})
+        output = self.project / "result.json"
+        cwd = os.getcwd()
+        os.chdir(self.project)
+        try:
+            with patch.object(llm_checker, "load_bank", return_value=bank), \
+                 patch.object(llm_checker, "codex_executable", side_effect=AssertionError("codex used")), \
+                 patch.object(llm_checker, "run_claude_api", return_value=(row["text"], {"output_tokens": 9})) as run, \
+                 patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
+                self.assertEqual(llm_checker.main(["-m", "Opus", "-n", "1", "--timeout", "30",
+                                                   "--output", str(output)]), 0)
+        finally:
+            os.chdir(cwd)
+        config, prompt, timeout = run.call_args.args
+        self.assertEqual(config["model"], "claude-opus-5-5")
+        self.assertEqual(config["url"], "https://relay.invalid/v1/messages")
+        self.assertEqual(timeout, 30)
+        self.assertIn("测试模型：opus → claude-opus-5-5", stdout.getvalue())
+        self.assertIn("sk-T...4567", stdout.getvalue())
+        self.assertNotIn("sk-TESTTOKEN1234567", stdout.getvalue())
+        saved = json.loads(output.read_text())
+        self.assertEqual(saved["api_model"], "claude-opus-5-5")
+
+
+class ClaudeRequestTests(unittest.TestCase):
+    CONFIG = {"model": "claude-opus-5-5", "url": "https://relay.invalid/v1/messages", "proxies": {},
+              "headers": {"authorization": "Bearer sk-test", "anthropic-version": "2023-06-01",
+                          "content-type": "application/json"}}
+
+    def respond(self, payload):
+        response = Mock()
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        opener = Mock()
+        opener.open.return_value = response
+        return patch.object(llm_checker, "_claude_opener", return_value=opener), opener
+
+    def test_request_is_bare_messages_call(self):
+        patcher, opener = self.respond({
+            "type": "message", "stop_reason": "end_turn", "usage": {"output_tokens": 12},
+            "content": [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "1, 2, 3"}]})
+        with patcher:
+            answer, usage = llm_checker.run_claude_api(self.CONFIG, "prompt", timeout=10)
+        self.assertEqual(answer, "1, 2, 3")
+        self.assertEqual(usage["output_tokens"], 12)
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://relay.invalid/v1/messages")
+        self.assertEqual(request.get_header("Authorization"), "Bearer sk-test")
+        body = json.loads(request.data)
+        self.assertEqual(body["model"], "claude-opus-5-5")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "prompt"}])
+        self.assertNotIn("system", body)
+        self.assertNotIn("temperature", body)
+        self.assertLessEqual(opener.open.call_args.kwargs["timeout"], 10)
+
+    def test_refusal_and_truncation_are_rejected(self):
+        for reason, message in (("refusal", "拒绝"), ("max_tokens", "截断")):
+            patcher, _ = self.respond({"stop_reason": reason, "content": [{"type": "text", "text": "1"}]})
+            with patcher, self.assertRaisesRegex(RuntimeError, message):
+                llm_checker.run_claude_api(self.CONFIG, "prompt")
+
+    def test_http_error_message_is_compacted(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError(self.CONFIG["url"], 401, "Unauthorized", {},
+                                       io.BytesIO(b'{"type":"error","error":{"message":"invalid x-api-key"}}'))
+        opener = Mock()
+        opener.open.side_effect = error
+        with patch.object(llm_checker, "_claude_opener", return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 401：invalid x-api-key"):
+                llm_checker.run_claude_api(self.CONFIG, "prompt")
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_timeout_is_reported(self):
+        opener = Mock()
+        opener.open.side_effect = TimeoutError("timed out")
+        with patch.object(llm_checker, "_claude_opener", return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, "超过 5 秒未返回"):
+                llm_checker.run_claude_api(self.CONFIG, "prompt", timeout=5)
+
 if __name__ == "__main__":
     unittest.main()

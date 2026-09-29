@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ModelTrace number probes through the local Codex CLI (stdlib only)."""
+"""Run ModelTrace number probes through the local Codex CLI or Claude Code API config (stdlib only)."""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +11,11 @@ import random
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +26,18 @@ CODEX_TIMEOUT_SECONDS = 120
 MAX_ANSWER_CHARS = 8192
 OFFICIAL_PROVIDER_IDS = {"openai", "ollama", "lmstudio", "amazon-bedrock"}
 AUTH_HEADER_NAMES = {"authorization", "x-api-key", "api-key"}
+CLAUDE_TIERS = ("fable", "opus", "sonnet", "haiku")
+CLAUDE_DEFAULT_MODELS = {"fable": "claude-fable-5-1", "opus": "claude-opus-5-5",
+                         "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-4-5-20251001"}
+CLAUDE_DEFAULT_BASE_URL = "https://api.anthropic.com"
+CLAUDE_CLOUD_PROVIDERS = {"CLAUDE_CODE_USE_BEDROCK": "Amazon Bedrock", "CLAUDE_CODE_USE_VERTEX": "Google Vertex AI",
+                          "CLAUDE_CODE_USE_FOUNDRY": "Microsoft Foundry"}
+CLAUDE_USER_AGENT = "claude-cli/2.1.284 (external, cli)"
+CLAUDE_MAX_TOKENS = 16000
+CLAUDE_MAX_ATTEMPTS = 3
+CLAUDE_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 529}
+CLAUDE_HELPER_TIMEOUT_SECONDS = 30
+MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][\w.:/@-]*(\[[^\]\s]+\])?")
 
 
 def numbers_from(text):
@@ -551,6 +566,288 @@ def run_codex(executable, model, effort, prompt, timeout=CODEX_TIMEOUT_SECONDS):
     return answer, usage
 
 
+def claude_tier(model):
+    name = (model or "").strip().lower()
+    return name if name in CLAUDE_TIERS else ""
+
+
+def _display_path(path):
+    path = Path(path).expanduser()
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _claude_config_dir():
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _managed_settings_dir():
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    if os.name == "nt":
+        return Path(r"C:\Program Files\ClaudeCode")
+    return Path("/etc/claude-code")
+
+
+def claude_settings_files(project_dir=None):
+    """Claude Code settings files, lowest precedence first (user < project < local < managed)."""
+    project = Path(project_dir) if project_dir else Path.cwd()
+    managed = _managed_settings_dir()
+    files = [_claude_config_dir() / "settings.json",
+             project / ".claude" / "settings.json",
+             project / ".claude" / "settings.local.json",
+             managed / "managed-settings.json"]
+    drop_ins = managed / "managed-settings.d"
+    if drop_ins.is_dir():
+        files.extend(sorted(drop_ins.glob("*.json")))
+    unique, seen = [], set()
+    for path in files:
+        key = os.path.normcase(os.path.abspath(path.expanduser()))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _read_settings(path):
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Claude Code 配置文件不是合法 JSON：{_display_path(path)}（{error}）") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"Claude Code 配置文件顶层必须是 JSON 对象：{_display_path(path)}")
+    return data
+
+
+def load_claude_settings(project_dir=None):
+    """Merge Claude Code settings; `env` entries override the shell environment like Claude Code does."""
+    env = {name: (value, "环境变量") for name, value in os.environ.items()}
+    settings, files = {}, []
+    for path in claude_settings_files(project_dir):
+        data = _read_settings(path)
+        if data is None:
+            continue
+        label = _display_path(path)
+        files.append(label)
+        block = data.get("env")
+        if isinstance(block, dict):
+            for name, value in block.items():
+                if value is not None:
+                    env[str(name)] = (value if isinstance(value, str) else json.dumps(value), label)
+        for key, value in data.items():
+            if key != "env":
+                settings[key] = (value, label)
+    return {"env": env, "settings": settings, "files": files}
+
+
+def _env_value(env, name):
+    value, source = env.get(name, ("", ""))
+    value = value.strip()
+    return (value, source) if value else ("", "")
+
+
+def _truthy(value):
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _oauth_login_detected(env):
+    return bool(_env_value(env, "CLAUDE_CODE_OAUTH_TOKEN")[0]) or (_claude_config_dir() / ".credentials.json").is_file()
+
+
+def _run_api_key_helper(command, env):
+    try:
+        process = subprocess.run(command, shell=True, text=True, encoding="utf-8", errors="replace",
+                                 capture_output=True, timeout=CLAUDE_HELPER_TIMEOUT_SECONDS,
+                                 env={name: value for name, (value, _) in env.items()})
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"apiKeyHelper 超过 {CLAUDE_HELPER_TIMEOUT_SECONDS} 秒未返回") from error
+    key = process.stdout.strip()
+    if process.returncode or not key:
+        details = process.stderr.strip() or f"退出码 {process.returncode}，无输出"
+        raise RuntimeError(f"apiKeyHelper 执行失败：{details[:300]}")
+    return key
+
+
+def _claude_credential(loaded):
+    env = loaded["env"]
+    token, source = _env_value(env, "ANTHROPIC_AUTH_TOKEN")
+    if token:
+        return "ANTHROPIC_AUTH_TOKEN", token, source, {"authorization": f"Bearer {token}"}
+    api_key, source = _env_value(env, "ANTHROPIC_API_KEY")
+    if api_key:
+        return "ANTHROPIC_API_KEY", api_key, source, {"x-api-key": api_key}
+    helper, source = loaded["settings"].get("apiKeyHelper", ("", ""))
+    if isinstance(helper, str) and helper.strip():
+        key = _run_api_key_helper(helper, env)
+        return "apiKeyHelper", key, source, {"x-api-key": key, "authorization": f"Bearer {key}"}
+    if _oauth_login_detected(env):
+        raise RuntimeError("检测到 Claude Code 使用官方账号（订阅 / OAuth）登录；本工具只支持 API 方式，"
+                           "请在环境变量或 settings.json 的 env 中配置 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY")
+    raise RuntimeError("未找到 Claude Code 的 API 凭证；请在环境变量或 settings.json 的 env 中配置 "
+                       "ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY，或在 settings.json 中配置 apiKeyHelper")
+
+
+def resolve_claude_model(tier, env):
+    """Map a tier to the model ID Claude Code would request for it."""
+    upper = tier.upper()
+    model_var = f"ANTHROPIC_DEFAULT_{upper}_MODEL"
+    value, source = _env_value(env, model_var)
+    if value:
+        return re.sub(r"\[1m\]$", "", value, flags=re.I), model_var, source
+    # *_MODEL_NAME is officially the /model picker display name, but some setups put the model ID there.
+    name_var = f"{model_var}_NAME"
+    value, source = _env_value(env, name_var)
+    if value and MODEL_ID_PATTERN.fullmatch(value):
+        return re.sub(r"\[1m\]$", "", value, flags=re.I), name_var, source
+    return CLAUDE_DEFAULT_MODELS[tier], "", ""
+
+
+def _parse_custom_headers(text):
+    headers = {}
+    for line in text.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip():
+            headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _claude_proxies(env, url):
+    proxies = {}
+    for name, (value, _) in env.items():
+        lowered = name.lower()
+        if value and lowered.endswith("_proxy") and (name == lowered or lowered[:-6] not in proxies):
+            proxies[lowered[:-6]] = value
+    host = urllib.parse.urlparse(url).hostname or ""
+    if "no" in proxies and urllib.request.proxy_bypass_environment(host, proxies):
+        return {}
+    proxies.pop("no", None)
+    return proxies
+
+
+def resolve_claude_config(tier, project_dir=None):
+    """Read endpoint, credentials and tier model from Claude Code config, like Claude Code resolves them."""
+    loaded = load_claude_settings(project_dir)
+    env = loaded["env"]
+    for name, provider in CLAUDE_CLOUD_PROVIDERS.items():
+        value, source = _env_value(env, name)
+        if _truthy(value):
+            raise RuntimeError(f"Claude Code 当前使用 {provider}（{name}，来自{source}），暂不支持；仅支持 Anthropic API 方式")
+    credential_name, secret, credential_source, auth_headers = _claude_credential(loaded)
+    base_url, base_source = _env_value(env, "ANTHROPIC_BASE_URL")
+    url = (base_url or CLAUDE_DEFAULT_BASE_URL).rstrip("/") + "/v1/messages"
+    headers = {"anthropic-version": "2023-06-01", "content-type": "application/json", "accept": "application/json",
+               "user-agent": os.environ.get("MODELTRACE_USER_AGENT", "").strip() or CLAUDE_USER_AGENT}
+    betas, _ = _env_value(env, "ANTHROPIC_BETAS")
+    if betas:
+        headers["anthropic-beta"] = ",".join(item.strip() for item in betas.split(",") if item.strip())
+    headers.update(auth_headers)
+    custom, _ = _env_value(env, "ANTHROPIC_CUSTOM_HEADERS")
+    headers.update(_parse_custom_headers(custom))
+    model, model_var, model_source = resolve_claude_model(tier, env)
+    return {"tier": tier, "model": model, "model_var": model_var, "model_source": model_source,
+            "url": url, "base_source": base_source if base_url else "",
+            "credential": credential_name, "secret": secret, "credential_source": credential_source,
+            "headers": headers, "proxies": _claude_proxies(env, url),
+            "config_dir": _claude_config_dir(), "files": loaded["files"]}
+
+
+def print_claude_config(config):
+    def origin(name, source):
+        return f"{name}，来自{source}" if source else name
+
+    config_dir = _display_path(config["config_dir"])
+    print(f"Claude 配置目录：{config_dir}{'（CLAUDE_CONFIG_DIR）' if os.environ.get('CLAUDE_CONFIG_DIR') else ''}", flush=True)
+    print(f"已读取配置：{'、'.join(config['files']) or '无配置文件（仅环境变量）'}", flush=True)
+    endpoint = origin("ANTHROPIC_BASE_URL", config["base_source"]) if config["base_source"] else "官方默认"
+    print(f"API 端点：{config['url']}（{endpoint}）", flush=True)
+    masked = _mask_secret(config["secret"]) or "已设置"
+    print(f"API 凭证：{config['credential']} {masked}（来自{config['credential_source']}）", flush=True)
+    source = origin(config["model_var"], config["model_source"]) if config["model_var"] else "未配置，使用内置默认"
+    print(f"测试模型：{config['tier']} → {config['model']}（{source}）", flush=True)
+
+
+def _claude_opener(proxies):
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _compact_http_error(details, fallback):
+    text = (details or "").strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("cloudflare", "just a moment", "cf-ray", "attention required")):
+        return "请求被上游网关拦截（Cloudflare/WAF 拦截页）"
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return text[:300] or str(fallback)
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:300]
+    return str(error or payload)[:300]
+
+
+def run_claude_api(config, prompt, timeout=CODEX_TIMEOUT_SECONDS):
+    """Send one bare Anthropic Messages request (no Claude Code system prompt) and return (answer, usage)."""
+    body = json.dumps({"model": config["model"], "max_tokens": CLAUDE_MAX_TOKENS,
+                       "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+    opener = _claude_opener(config["proxies"])
+    deadline = time.monotonic() + timeout
+    timeout_message = f"Claude API 超过 {timeout} 秒未返回，已中止（可能陷入重复输出）"
+    payload = None
+    for attempt in range(1, CLAUDE_MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(timeout_message)
+        request = urllib.request.Request(config["url"], data=body, headers=config["headers"], method="POST")
+        try:
+            with opener.open(request, timeout=remaining) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")
+            delay = attempt + random.uniform(0, 0.5)
+            if (attempt < CLAUDE_MAX_ATTEMPTS and error.code in CLAUDE_RETRYABLE_STATUS
+                    and deadline - time.monotonic() > delay):
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"HTTP {error.code}：{_compact_http_error(details, error.reason)}") from error
+        except (TimeoutError, socket.timeout) as error:
+            raise RuntimeError(timeout_message) from error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, (TimeoutError, socket.timeout)):
+                raise RuntimeError(timeout_message) from error
+            delay = attempt + random.uniform(0, 0.5)
+            if attempt < CLAUDE_MAX_ATTEMPTS and deadline - time.monotonic() > delay:
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"无法连接 Claude API：{error.reason}") from error
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise RuntimeError("Claude API 返回的不是 JSON；请确认 ANTHROPIC_BASE_URL 指向 API 端点") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("Claude API 返回格式不正确")
+    if payload.get("type") == "error" or payload.get("error"):
+        raise RuntimeError(f"Claude API 返回错误：{_compact_http_error(json.dumps(payload), '')}")
+    stop_reason = payload.get("stop_reason")
+    if stop_reason == "refusal":
+        raise RuntimeError("模型拒绝生成，本次回答不计入")
+    if stop_reason == "max_tokens":
+        raise RuntimeError("回答因 max_tokens 截断，本次回答不计入")
+    blocks = payload.get("content") if isinstance(payload.get("content"), list) else []
+    answer = "".join(block.get("text", "") for block in blocks
+                     if isinstance(block, dict) and block.get("type") == "text")
+    if not answer.strip():
+        raise RuntimeError("Claude API 未返回文本")
+    if len(answer) > MAX_ANSWER_CHARS:
+        raise RuntimeError(f"回答过长（{len(answer)} 字符），可能陷入重复输出，本次不计入")
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    return answer, usage
+
+
 def load_bank(source):
     if source:
         if source.startswith(("https://", "http://")):
@@ -571,9 +868,10 @@ def load_bank(source):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="用本机 Codex CLI 运行 ModelTrace 模型指纹测试")
-    parser.add_argument("-m", "--model", help="传给 codex exec 的模型名；省略时使用 Codex 默认模型")
-    parser.add_argument("-r", "--reasoning", default="low", help="推理等级，默认 low")
+    parser = argparse.ArgumentParser(description="用本机 Codex CLI 或 Claude Code 的 API 配置运行 ModelTrace 模型指纹测试")
+    parser.add_argument("-m", "--model", help="fable/opus/sonnet/haiku 读取 Claude Code API 配置直接请求；"
+                                              "其他值传给 codex exec；省略时使用 Codex 默认模型")
+    parser.add_argument("-r", "--reasoning", help="Codex 推理等级，默认 low；Claude 档位不使用")
     parser.add_argument("-n", "--number", type=int, default=3, help="探针数量，默认 3")
     parser.add_argument("-j", "--max-concurrency", "--concurrency", type=int, default=3,
                         help="最多同时运行的探针数，默认 3")
@@ -594,16 +892,29 @@ def main(argv=None):
         for model in bank["models"]:
             print(f'{model["id"]}\t{model.get("family") or "models"}')
         return 0
-    executable = codex_executable()
-    print(f"CODEX_HOME：{format_codex_home()}", flush=True)
-    print(f"Codex 账号：{get_codex_account_info()}", flush=True)
+    tier = claude_tier(args.model)
+    details = {}
+    if tier:
+        config = resolve_claude_config(tier)
+        print_claude_config(config)
+        if args.reasoning:
+            print("提示：-r 只对 Codex 生效；Claude 档位按 API 默认设置发送，不附加推理参数", flush=True)
+        target = f"Claude {tier}（{config['model']}）"
+        task = (run_claude_api, config)
+        details = {"api_model": config["model"], "endpoint": config["url"]}
+    else:
+        executable = codex_executable()
+        print(f"CODEX_HOME：{format_codex_home()}", flush=True)
+        print(f"Codex 账号：{get_codex_account_info()}", flush=True)
+        target = args.model or "Codex 默认模型"
+        task = (run_codex, executable, args.model, args.reasoning or "low")
     probes = list(challenges(args.number))
     responses_by_index = [None] * len(probes)
     workers = min(args.max_concurrency, len(probes))
-    print(f"开始测试 {args.model or 'Codex 默认模型'}：{len(probes)} 道探针，最多并发 {workers} 道，超时 {args.timeout}s…", flush=True)
+    print(f"开始测试 {target}：{len(probes)} 道探针，最多并发 {workers} 道，超时 {args.timeout}s…", flush=True)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(run_codex, executable, args.model, args.reasoning, probe["prompt"], args.timeout): index
+            pool.submit(*task, probe["prompt"], args.timeout): index
             for index, probe in enumerate(probes)
         }
         for future in as_completed(futures):
@@ -631,7 +942,7 @@ def main(argv=None):
     print("提示：概率只在当前指纹库的候选模型之间分配，不能证明模型的真实身份。")
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps({"requested_model": args.model, "responses": responses, "result": result},
+        args.output.write_text(json.dumps({"requested_model": args.model, **details, "responses": responses, "result": result},
                                           ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"原始回答已保存：{args.output}")
     return 0
