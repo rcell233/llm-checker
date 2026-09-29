@@ -1,71 +1,41 @@
 # llm-checker
 
-用本地 Codex CLI，或者直接读取 Claude Code 的 API 配置，执行 [ModelTrace](https://github.com/xqy2006/ModelTrace) 的长整数指纹探针，并在终端显示候选模型归因。
+用 [ModelTrace](https://github.com/xqy2006/ModelTrace) 的长整数指纹探针检测 Codex 或 Claude Code 背后的实际模型，在终端显示候选模型归因。
 
 ## 快速开始
 
-前提：可用 `python3`。检测 Codex 需要已安装并登录 `codex` CLI；检测 Claude 只需要 Claude Code 已配置 API（不需要调用 `claude` 命令）。
-
 ### 一键测试
+
+检测 Codex（需已安装并登录 `codex` CLI）：
 
 ```sh
 wget -qO- "https://raw.githubusercontent.com/rcell233/llm-checker/main/llm_checker.py" | python3 - -m gpt-6-astra
 ```
 
-或在本地仓库运行：
+检测 Claude Code（需已用 API 方式配置 Claude Code，不支持官方账号登录）：
 
 ```sh
-python3 llm_checker.py -m gpt-6-astra
+wget -qO- "https://raw.githubusercontent.com/rcell233/llm-checker/main/llm_checker.py" | python3 - -m opus
 ```
+
+Claude 档位可选 `fable`、`opus`、`sonnet`、`haiku`。脚本会自动读取 Claude Code 配置中的 API 地址、密钥和该档位对应的模型，直接发送 API 请求（不经过 Claude Code，避免其系统提示词影响结果）。
+
+在本地仓库中运行时，把 `wget ... | python3 -` 换成 `python3 llm_checker.py` 即可。
 
 ### 参数说明
 
-- `-m, --model`：codex 模型名（省略则使用 Codex 默认模型）；`fable`、`opus`、`sonnet`、`haiku` 会切换到 Claude Code API 检测（见下文）
-- `-r, --reasoning`：Codex 推理等级 `low/medium/high/xhigh`（默认 `low`，Claude 档位不使用）
-- `--timeout`：单道探针超时秒数（默认 120）
+- `-m, --model`：Codex 模型名（省略则使用 Codex 默认模型），或 Claude 档位 `fable/opus/sonnet/haiku`
+- `-r, --reasoning`：Codex 推理等级 `low/medium/high/xhigh`（默认 `low`）
 - `-n, --number`：探针数量（默认 3）
 - `-j, --max-concurrency`：并发探针数（默认 3）
+- `--timeout`：单道探针超时秒数（默认 120）
 - `--list-models`：列出指纹库中的候选模型
 - `--output <file>`：保存提示词、原始回答和评分结果为 JSON
 - `--bank <path>`：使用自定义指纹库
 
-运行脚本只使用 Python 标准库；首次会从本仓库下载约 834 KB 的统一指纹库。如果在本仓库目录运行，会直接读取本地 `data/unified_bank.json`。
+脚本只依赖 Python 标准库；首次运行会下载约 834 KB 的指纹库，在本仓库目录运行则直接读取 `data/unified_bank.json`。
 
-当前指纹库同步自 [ModelTrace `55a2e4a`](https://github.com/xqy2006/ModelTrace/commit/55a2e4a55170423b484d701e9a82ab62b268c811)，共 16 个候选模型，包含 `gpt-6-sol`、`gpt-6-luna` 和 `claude-opus-5-5`。原始参考数据与统一指纹库均直接采用该上游版本。
-
-### Claude Code（API 方式）
-
-`-m` 为 `fable`、`opus`、`sonnet` 或 `haiku`（不区分大小写）时，脚本会读取 Claude Code 的配置，**绕过 `claude` CLI，直接发送一条不带系统提示词的 Anthropic Messages 请求**（`POST {ANTHROPIC_BASE_URL}/v1/messages`）。这样做是因为 Claude Code 的系统提示词会明显改变数字偏好，而指纹库是用裸 API 请求采集的。
-
-```sh
-cd /path/to/your/project   # 在项目目录运行，才会读到项目级 .claude/ 配置
-python3 llm_checker.py -m opus
-```
-
-只支持用 API 方式使用的 Claude Code。官方账号（订阅 / OAuth）登录，以及 Bedrock、Vertex、Foundry 这类云厂商配置都会直接报错退出。
-
-配置读取顺序与 Claude Code 保持一致，后面的覆盖前面的：
-
-1. Shell 环境变量
-2. 用户配置 `~/.claude/settings.json`（设置了 `CLAUDE_CONFIG_DIR` 时读取该目录）
-3. 项目配置 `./.claude/settings.json`
-4. 项目本地配置 `./.claude/settings.local.json`
-5. 托管配置：`managed-settings.json` 及 `managed-settings.d/*.json`（Linux/WSL 为 `/etc/claude-code/`，macOS 为 `/Library/Application Support/ClaudeCode/`，Windows 为 `C:\Program Files\ClaudeCode\`）
-
-settings 文件 `env` 中的变量会覆盖同名 Shell 环境变量；值为空字符串视为未设置。用到的配置项：
-
-| 配置项 | 用途 |
-| --- | --- |
-| `ANTHROPIC_BASE_URL` | API 端点，默认 `https://api.anthropic.com` |
-| `ANTHROPIC_AUTH_TOKEN` | 以 `Authorization: Bearer` 发送（优先） |
-| `ANTHROPIC_API_KEY` | 以 `x-api-key` 发送 |
-| `apiKeyHelper`（settings 顶层） | 执行该命令，输出同时作为 `x-api-key` 和 Bearer 发送 |
-| `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | 档位对应的模型 ID；末尾的 `[1m]` 会被去掉 |
-| `ANTHROPIC_DEFAULT_*_MODEL_NAME` | 没有 `*_MODEL` 时的后备（官方定义为 `/model` 菜单中的显示名，仅在值形如模型 ID 时采用） |
-| `ANTHROPIC_CUSTOM_HEADERS`、`ANTHROPIC_BETAS` | 附加请求头（每行一个 `Name: Value`）和 `anthropic-beta` |
-| `HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY` | 代理设置 |
-
-档位没有配置模型时，使用内置默认值：`fable` → `claude-fable-5-1`，`opus` → `claude-opus-5-5`，`sonnet` → `claude-sonnet-5-5`，`haiku` → `claude-haiku-4-5-20251001`。运行时会打印实际使用的端点、脱敏后的凭证、模型 ID，以及每一项分别来自哪个文件。
+当前指纹库同步自 [ModelTrace `55a2e4a`](https://github.com/xqy2006/ModelTrace/commit/55a2e4a55170423b484d701e9a82ab62b268c811)，共 16 个候选模型，包含 `gpt-6-sol`、`gpt-6-luna` 和 `claude-opus-5-5`。
 
 ### 结果说明
 
